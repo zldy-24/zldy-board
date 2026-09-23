@@ -1,14 +1,15 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    ActionId, ContextSnapshot, EngineId, ImeError, InputEvent, MarkedTextSupport, ModeId,
-    SessionId, StateRevision,
+    ActionId, CandidateId, ContextSnapshot, EngineId, ImeError, InputEvent, MarkedTextSupport,
+    ModeId, SessionId, StateRevision,
+    candidate::CandidateSnapshot,
     composer::{Composer, ComposerSnapshot},
     engine::EngineInner,
     input::{InputNormalizer, LogicalInput, NormalizedHardwareEvent},
     state::{
-        AckOutcome, ActionDisposition, CommitKind, EventHandling, ImeAction, ImeActionKind,
-        ImeResult, ImeState, ImeStatus, PlatformResetReason, SessionPhase,
+        AckOutcome, ActionDisposition, CommitKind, DegradedComponent, EventHandling, ImeAction,
+        ImeActionKind, ImeResult, ImeState, ImeStatus, PlatformResetReason, SessionPhase,
     },
 };
 
@@ -20,6 +21,8 @@ pub struct ImeSession {
     state_revision: StateRevision,
     phase: SessionPhase,
     composer: Composer,
+    candidate_snapshot: CandidateSnapshot,
+    degraded_components: Vec<DegradedComponent>,
     context: ContextSnapshot,
     mode: ModeId,
     next_action_id: u64,
@@ -58,6 +61,8 @@ impl ImeSession {
             state_revision: StateRevision::new(0),
             phase: SessionPhase::Idle,
             composer: Composer::new(),
+            candidate_snapshot: CandidateSnapshot::empty(session_id, StateRevision::new(0)),
+            degraded_components: Vec::new(),
             context: ContextSnapshot::default(),
             mode: ModeId::default(),
             next_action_id: 1,
@@ -96,8 +101,8 @@ impl ImeSession {
             composition_utf8: self.composer.text().to_owned(),
             composition_cursor_grapheme: self.composer.cursor_grapheme(),
             composition_cursor_utf8_byte_offset: self.composer.cursor_utf8_byte_offset(),
-            candidates: Vec::new(),
-            selected_candidate: None,
+            candidates: self.candidate_snapshot.views(),
+            selected_candidate: self.candidate_snapshot.selected_candidate_id(),
             mode: self.mode,
         }
     }
@@ -119,11 +124,14 @@ impl ImeSession {
             InputEvent::HardwareKey(event) => self.process_hardware_key(event)?,
             InputEvent::Commit => self.process_logical(LogicalInput::Commit)?,
             InputEvent::Cancel => self.process_logical(LogicalInput::Cancel)?,
+            InputEvent::SelectCandidate {
+                candidate_id,
+                state_revision,
+            } => self.select_candidate(candidate_id, state_revision)?,
+            InputEvent::MoveCandidateSelection { delta } => self.move_candidate_selection(delta)?,
             InputEvent::ContextChanged(context) => self.process_context_changed(context)?,
             InputEvent::Reset => self.process_reset()?,
-            InputEvent::SelectCandidate { .. }
-            | InputEvent::MoveCandidateSelection { .. }
-            | InputEvent::NextCandidatePage
+            InputEvent::NextCandidatePage
             | InputEvent::PreviousCandidatePage
             | InputEvent::SwitchMode(_)
             | InputEvent::FocusChanged(_) => ProcessOutcome::unsupported(),
@@ -173,7 +181,7 @@ impl ImeSession {
             return Ok(ProcessOutcome::pass_through());
         }
 
-        match InputNormalizer.normalize(event, self.phase == SessionPhase::Composing) {
+        match InputNormalizer.normalize(event, self.phase != SessionPhase::Idle) {
             NormalizedHardwareEvent::Logical(logical) => self.process_logical(logical),
             NormalizedHardwareEvent::PassThrough => Ok(ProcessOutcome::pass_through()),
         }
@@ -200,8 +208,8 @@ impl ImeSession {
         self.prepare_composition_update_action()?;
 
         self.composer.insert_text(&text);
-        self.phase = SessionPhase::Composing;
         self.bump_revision()?;
+        self.regenerate_candidates();
 
         let actions = self.composition_update_action()?;
         Ok(ProcessOutcome::ok(actions))
@@ -231,12 +239,8 @@ impl ImeSession {
             return Ok(ProcessOutcome::no_op());
         }
 
-        self.phase = if self.composer.is_empty() {
-            SessionPhase::Idle
-        } else {
-            SessionPhase::Composing
-        };
         self.bump_revision()?;
+        self.regenerate_candidates();
         let actions = self.composition_update_action()?;
         Ok(ProcessOutcome::ok(actions))
     }
@@ -262,12 +266,8 @@ impl ImeSession {
             return Ok(ProcessOutcome::no_op());
         }
 
-        self.phase = if self.composer.is_empty() {
-            SessionPhase::Idle
-        } else {
-            SessionPhase::Composing
-        };
         self.bump_revision()?;
+        self.regenerate_candidates();
         let actions = self.composition_update_action()?;
         Ok(ProcessOutcome::ok(actions))
     }
@@ -288,6 +288,7 @@ impl ImeSession {
         self.composer.move_cursor(grapheme_delta);
 
         self.bump_revision()?;
+        self.regenerate_candidates();
         let actions = self.composition_update_action()?;
         Ok(ProcessOutcome::ok(actions))
     }
@@ -297,11 +298,62 @@ impl ImeSession {
             return Ok(ProcessOutcome::no_op());
         }
 
+        let text_utf8 = self.composer.text().to_owned();
+        self.commit_text(text_utf8, CommitKind::DirectInput)
+    }
+
+    fn select_candidate(
+        &mut self,
+        candidate_id: CandidateId,
+        state_revision: StateRevision,
+    ) -> Result<ProcessOutcome, ImeError> {
+        if state_revision != self.state_revision {
+            return Err(ImeError::StaleRevision {
+                expected: self.state_revision,
+                actual: state_revision,
+            });
+        }
+        if self.phase != SessionPhase::CandidateSelecting {
+            return Ok(ProcessOutcome::unsupported());
+        }
+        if !self
+            .candidate_snapshot
+            .is_bound_to(self.session_id, self.state_revision)
+        {
+            return Err(ImeError::StaleRevision {
+                expected: self.state_revision,
+                actual: self.candidate_snapshot.revision(),
+            });
+        }
+        let text_utf8 = self
+            .candidate_snapshot
+            .candidate_text(candidate_id)
+            .ok_or(ImeError::UnknownCandidate(candidate_id))?
+            .to_owned();
+        self.commit_text(text_utf8, CommitKind::Candidate)
+    }
+
+    fn move_candidate_selection(&mut self, delta: i32) -> Result<ProcessOutcome, ImeError> {
+        if self.phase != SessionPhase::CandidateSelecting {
+            return Ok(ProcessOutcome::unsupported());
+        }
+        if !self.candidate_snapshot.move_selection(delta) {
+            return Ok(ProcessOutcome::no_op());
+        }
+        self.bump_revision()?;
+        Ok(ProcessOutcome::ok(Vec::new()))
+    }
+
+    fn commit_text(
+        &mut self,
+        text_utf8: String,
+        commit_kind: CommitKind,
+    ) -> Result<ProcessOutcome, ImeError> {
         self.supersede_pending_composition_updates();
         self.ensure_action_capacity()?;
         let composer = self.composer.recovery_snapshot();
-        let text_utf8 = self.composer.text().to_owned();
         self.composer.clear();
+        self.clear_candidates();
         self.phase = SessionPhase::Idle;
         self.bump_revision()?;
         let recovery = ActionRecovery::Commit(CommitRecovery {
@@ -313,7 +365,7 @@ impl ImeSession {
         let action = self.allocate_action_with_recovery(
             ImeActionKind::CommitText {
                 text_utf8,
-                commit_kind: CommitKind::DirectInput,
+                commit_kind,
             },
             recovery,
         )?;
@@ -333,6 +385,7 @@ impl ImeSession {
         }
 
         self.composer.clear();
+        self.clear_candidates();
         self.phase = SessionPhase::Idle;
         self.bump_revision()?;
 
@@ -369,6 +422,7 @@ impl ImeSession {
 
         self.supersede_all_pending();
         self.composer.clear();
+        self.clear_candidates();
         self.phase = SessionPhase::Idle;
         self.context = ContextSnapshot::default();
         self.reconciliation_required = false;
@@ -409,6 +463,42 @@ impl ImeSession {
             });
         }
         Ok(())
+    }
+
+    fn regenerate_candidates(&mut self) {
+        if self.composer.is_empty() {
+            self.clear_candidates();
+            self.phase = SessionPhase::Idle;
+            return;
+        }
+
+        match self.engine.candidate_engine.generate(
+            self.session_id,
+            self.state_revision,
+            self.composer.text(),
+            &self.engine.config.limits,
+        ) {
+            Ok(snapshot) => {
+                self.phase = if snapshot.is_empty() {
+                    SessionPhase::Composing
+                } else {
+                    SessionPhase::CandidateSelecting
+                };
+                self.candidate_snapshot = snapshot;
+                self.degraded_components.clear();
+            }
+            Err(failure) => {
+                self.candidate_snapshot =
+                    CandidateSnapshot::empty(self.session_id, self.state_revision);
+                self.phase = SessionPhase::Composing;
+                self.degraded_components = vec![failure.component];
+            }
+        }
+    }
+
+    fn clear_candidates(&mut self) {
+        self.candidate_snapshot = CandidateSnapshot::empty(self.session_id, self.state_revision);
+        self.degraded_components.clear();
     }
 
     fn composition_update_action(&mut self) -> Result<Vec<ImeAction>, ImeError> {
@@ -537,7 +627,7 @@ impl ImeSession {
                 ActionRecovery::Commit(recovery) if self.can_restore_commit(&recovery) => {
                     self.bump_revision()?;
                     self.composer.restore(recovery.composer);
-                    self.phase = SessionPhase::Composing;
+                    self.regenerate_candidates();
                     Ok(())
                 }
                 ActionRecovery::None | ActionRecovery::Commit(_) => {
@@ -605,6 +695,7 @@ impl ImeSession {
             .checked_add(1)
             .ok_or(ImeError::CounterExhausted("state_revision"))?;
         self.state_revision = StateRevision::new(next);
+        self.candidate_snapshot.rebind_revision(self.state_revision);
         Ok(())
     }
 
@@ -617,7 +708,7 @@ impl ImeSession {
             resource_generation: self.engine.resource_generation,
             state: self.snapshot(),
             actions: outcome.actions,
-            degraded_components: Vec::new(),
+            degraded_components: self.degraded_components.clone(),
             result_flags: Vec::new(),
         }
     }
@@ -666,11 +757,18 @@ impl ProcessOutcome {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{
         ActionDisposition, CandidateId, ContextSnapshot, CoreLimits, EngineConfig, EventHandling,
         FocusChange, HardwareKeyEvent, ImeActionKind, ImeEngine, ImeError, ImeStatus, InputEvent,
-        InputScope, KeyPhase, LogicalKey, MarkedTextSupport, Modifiers, PlatformCapabilities,
-        SessionPhase, SurroundingTextSupport,
+        InputScope, KeyPhase, LexemeId, LogicalKey, MarkedTextSupport, Modifiers,
+        PlatformCapabilities, SessionPhase, SurroundingTextSupport,
+        candidate::{CandidateProposal, CandidateProvider},
+        dictionary::{DictionaryEntry, InMemoryDictionary},
+        language::{ParsedInput, ReferenceLanguageEngine},
+        ranking::RankingEngine,
+        state::DegradedComponent,
     };
 
     fn engine_with_hardware() -> ImeEngine {
@@ -686,6 +784,37 @@ mod tests {
 
     fn default_engine() -> ImeEngine {
         ImeEngine::new(EngineConfig::default()).expect("default test config is valid")
+    }
+
+    fn engine_with_candidates() -> ImeEngine {
+        ImeEngine::with_reference_dictionary(
+            EngineConfig::default(),
+            InMemoryDictionary::new([
+                DictionaryEntry::new(LexemeId::new(1), "ni", "你", 1000),
+                DictionaryEntry::new(LexemeId::new(2), "nih", "你好", 100),
+                DictionaryEntry::new(LexemeId::new(3), "nihao", "你好", 3000),
+                DictionaryEntry::new(LexemeId::new(4), "nihao", "你号", 100),
+                DictionaryEntry::new(LexemeId::new(5), "nihaoma", "你好吗", 500),
+            ]),
+        )
+        .expect("candidate test config is valid")
+    }
+
+    #[derive(Debug)]
+    struct FailingProvider;
+
+    impl CandidateProvider for FailingProvider {
+        fn generate(
+            &self,
+            _input: &ParsedInput,
+            _limit: usize,
+        ) -> Result<Vec<CandidateProposal>, ImeError> {
+            Err(ImeError::InvalidConfig("injected candidate failure"))
+        }
+
+        fn degraded_component(&self) -> DegradedComponent {
+            DegradedComponent::Candidate
+        }
     }
 
     fn engine_with_marked_text() -> ImeEngine {
@@ -1431,6 +1560,253 @@ mod tests {
             .process_event(InputEvent::InsertText("still alive".into()))
             .expect("session retains EngineInner");
         assert_eq!(result.state.composition_utf8, "still alive");
+    }
+
+    #[test]
+    fn typing_generates_deterministic_case_normalized_candidates() {
+        let engine = engine_with_candidates();
+        let mut lowercase = engine.new_session().expect("session id is available");
+        let mut uppercase = engine.new_session().expect("session id is available");
+
+        let lower = lowercase
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("lowercase insert succeeds");
+        let upper = uppercase
+            .process_event(InputEvent::InsertText("NIHAO".into()))
+            .expect("uppercase insert succeeds");
+
+        assert_eq!(lower.state.phase, SessionPhase::CandidateSelecting);
+        assert_eq!(upper.state.phase, SessionPhase::CandidateSelecting);
+        let lower_text: Vec<_> = lower
+            .state
+            .candidates
+            .iter()
+            .map(|candidate| candidate.text.as_str())
+            .collect();
+        let upper_text: Vec<_> = upper
+            .state
+            .candidates
+            .iter()
+            .map(|candidate| candidate.text.as_str())
+            .collect();
+        assert_eq!(lower_text, upper_text);
+        assert_eq!(lower_text, ["你好", "你号", "你好吗"]);
+    }
+
+    #[test]
+    fn editing_regenerates_candidates_and_rejects_old_revision() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        let first = session
+            .process_event(InputEvent::InsertText("ni".into()))
+            .expect("first insert succeeds");
+        let old_revision = first.state_revision;
+
+        let edited = session
+            .process_event(InputEvent::InsertText("hao".into()))
+            .expect("editing succeeds");
+        assert_ne!(edited.state_revision, old_revision);
+        assert_eq!(edited.state.candidates[0].text, "你好");
+
+        let stale = session.process_event(InputEvent::SelectCandidate {
+            candidate_id: CandidateId::new(1),
+            state_revision: old_revision,
+        });
+        assert!(matches!(stale, Err(ImeError::StaleRevision { .. })));
+    }
+
+    #[test]
+    fn candidate_selection_commits_candidate_and_applied_finishes_idle() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        let generated = session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        let committed = session
+            .process_event(InputEvent::SelectCandidate {
+                candidate_id: CandidateId::new(1),
+                state_revision: generated.state_revision,
+            })
+            .expect("selection succeeds");
+
+        assert!(matches!(
+            &committed.actions[0].kind,
+            ImeActionKind::CommitText {
+                text_utf8,
+                commit_kind: crate::CommitKind::Candidate,
+            } if text_utf8 == "你好"
+        ));
+        assert_eq!(committed.state.phase, SessionPhase::Idle);
+        assert!(committed.state.candidates.is_empty());
+
+        session
+            .acknowledge_action(committed.actions[0].action_id, ActionDisposition::Applied)
+            .expect("candidate commit acknowledgement succeeds");
+        assert_eq!(session.snapshot().phase, SessionPhase::Idle);
+        assert!(session.snapshot().candidates.is_empty());
+    }
+
+    #[test]
+    fn failed_candidate_commit_restores_raw_input_with_new_snapshot() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        let generated = session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        let old_revision = generated.state_revision;
+        let action = session
+            .process_event(InputEvent::SelectCandidate {
+                candidate_id: CandidateId::new(1),
+                state_revision: old_revision,
+            })
+            .expect("selection succeeds")
+            .actions
+            .remove(0);
+        let post_commit_revision = session.state_revision();
+
+        session
+            .acknowledge_action(action.action_id, ActionDisposition::Failed)
+            .expect("failed commit is recovered");
+        let restored = session.snapshot();
+        assert_eq!(restored.phase, SessionPhase::CandidateSelecting);
+        assert_eq!(restored.composition_utf8, "nihao");
+        assert_eq!(restored.candidates[0].candidate_id, CandidateId::new(1));
+        assert!(session.state_revision() > post_commit_revision);
+
+        let stale = session.process_event(InputEvent::SelectCandidate {
+            candidate_id: CandidateId::new(1),
+            state_revision: old_revision,
+        });
+        assert!(matches!(stale, Err(ImeError::StaleRevision { .. })));
+    }
+
+    #[test]
+    fn stale_candidate_commit_failure_does_not_overwrite_new_input() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        let generated = session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        let action = session
+            .process_event(InputEvent::SelectCandidate {
+                candidate_id: CandidateId::new(1),
+                state_revision: generated.state_revision,
+            })
+            .expect("selection succeeds")
+            .actions
+            .remove(0);
+        session
+            .process_event(InputEvent::InsertText("x".into()))
+            .expect("new input succeeds");
+
+        session
+            .acknowledge_action(action.action_id, ActionDisposition::Failed)
+            .expect("stale failure is recorded");
+        assert_eq!(session.snapshot().composition_utf8, "x");
+        assert!(session.reconciliation_required());
+    }
+
+    #[test]
+    fn raw_commit_remains_direct_input_when_candidates_exist() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        let committed = session
+            .process_event(InputEvent::Commit)
+            .expect("raw commit succeeds");
+        assert!(matches!(
+            &committed.actions[0].kind,
+            ImeActionKind::CommitText {
+                text_utf8,
+                commit_kind: crate::CommitKind::DirectInput,
+            } if text_utf8 == "nihao"
+        ));
+    }
+
+    #[test]
+    fn moving_candidate_selection_clamps_and_invalidates_old_revision() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        let generated = session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        assert_eq!(
+            generated.state.selected_candidate,
+            Some(CandidateId::new(1))
+        );
+
+        let moved = session
+            .process_event(InputEvent::MoveCandidateSelection { delta: 1 })
+            .expect("selection movement succeeds");
+        assert_eq!(moved.state.selected_candidate, Some(CandidateId::new(2)));
+        assert!(moved.state_revision > generated.state_revision);
+
+        let clamped = session
+            .process_event(InputEvent::MoveCandidateSelection { delta: 99 })
+            .expect("clamped movement succeeds");
+        assert_eq!(clamped.state.selected_candidate, Some(CandidateId::new(3)));
+        let no_op = session
+            .process_event(InputEvent::MoveCandidateSelection { delta: 1 })
+            .expect("boundary movement succeeds");
+        assert_eq!(no_op.status, ImeStatus::NoOp);
+
+        let stale = session.process_event(InputEvent::SelectCandidate {
+            candidate_id: CandidateId::new(1),
+            state_revision: generated.state_revision,
+        });
+        assert!(matches!(stale, Err(ImeError::StaleRevision { .. })));
+    }
+
+    #[test]
+    fn cancel_and_reset_clear_candidates() {
+        let engine = engine_with_candidates();
+        let mut session = engine.new_session().expect("session id is available");
+        session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        let cancelled = session
+            .process_event(InputEvent::Cancel)
+            .expect("cancel succeeds");
+        assert!(cancelled.state.candidates.is_empty());
+
+        session
+            .process_event(InputEvent::InsertText("nihao".into()))
+            .expect("insert succeeds");
+        let reset = session
+            .process_event(InputEvent::Reset)
+            .expect("reset succeeds");
+        assert!(reset.state.candidates.is_empty());
+    }
+
+    #[test]
+    fn recoverable_pipeline_failure_keeps_direct_input_available() {
+        let engine = ImeEngine::with_candidate_pipeline(
+            EngineConfig::default(),
+            Arc::new(ReferenceLanguageEngine),
+            vec![Arc::new(FailingProvider)],
+            RankingEngine,
+        )
+        .expect("failure test engine is valid");
+        let mut session = engine.new_session().expect("session id is available");
+        let inserted = session
+            .process_event(InputEvent::InsertText("raw".into()))
+            .expect("raw input survives pipeline failure");
+        assert_eq!(inserted.state.phase, SessionPhase::Composing);
+        assert!(inserted.state.candidates.is_empty());
+        assert_eq!(inserted.degraded_components, [DegradedComponent::Candidate]);
+
+        let committed = session
+            .process_event(InputEvent::Commit)
+            .expect("direct commit remains available");
+        assert!(matches!(
+            &committed.actions[0].kind,
+            ImeActionKind::CommitText {
+                text_utf8,
+                commit_kind: crate::CommitKind::DirectInput,
+            } if text_utf8 == "raw"
+        ));
     }
 
     #[test]

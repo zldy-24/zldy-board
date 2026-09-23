@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::ActionId;
+use crate::{ActionId, CandidateId, StateRevision};
 
 /// A recoverable error reported by the Core API.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +21,13 @@ pub enum ImeError {
     TooManyOutstandingActions { max: usize },
     /// An acknowledgement refers to an action that this Session does not know.
     UnknownAction(ActionId),
+    /// A candidate selection was produced for an older Session revision.
+    StaleRevision {
+        expected: StateRevision,
+        actual: StateRevision,
+    },
+    /// A candidate ID does not exist in the current snapshot.
+    UnknownCandidate(CandidateId),
     /// A monotonic identifier reached its representable limit.
     CounterExhausted(&'static str),
 }
@@ -49,6 +56,15 @@ impl fmt::Display for ImeError {
             }
             Self::UnknownAction(action_id) => {
                 write!(formatter, "unknown action id {}", action_id.get())
+            }
+            Self::StaleRevision { expected, actual } => write!(
+                formatter,
+                "stale state revision {}; current revision is {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::UnknownCandidate(candidate_id) => {
+                write!(formatter, "unknown candidate id {}", candidate_id.get())
             }
             Self::CounterExhausted(counter) => write!(formatter, "{counter} counter exhausted"),
         }

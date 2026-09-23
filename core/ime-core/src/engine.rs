@@ -4,7 +4,12 @@ use std::sync::{
 };
 
 use crate::{
-    CoreLimits, EngineId, ImeError, ImeSession, PlatformCapabilities, ResourceGeneration, SessionId,
+    CoreLimits, EngineId, ImeError, ImeSession, PlatformCapabilities, ResourceGeneration,
+    SessionId,
+    candidate::{CandidateEngine, CandidateProvider, DictionaryCandidateProvider},
+    dictionary::InMemoryDictionary,
+    language::{LanguageEngine, ReferenceLanguageEngine},
+    ranking::RankingEngine,
 };
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
@@ -28,11 +33,37 @@ pub(crate) struct EngineInner {
     pub(crate) engine_id: EngineId,
     pub(crate) resource_generation: ResourceGeneration,
     pub(crate) config: EngineConfig,
+    pub(crate) candidate_engine: CandidateEngine,
 }
 
 impl ImeEngine {
     /// Creates an Engine after validating all hard limits.
     pub fn new(config: EngineConfig) -> Result<Self, ImeError> {
+        Self::with_reference_dictionary(config, InMemoryDictionary::default())
+    }
+
+    /// Creates an Engine using the Phase 1B reference language and a read-only in-memory dictionary.
+    pub fn with_reference_dictionary(
+        config: EngineConfig,
+        dictionary: InMemoryDictionary,
+    ) -> Result<Self, ImeError> {
+        let provider: Arc<dyn CandidateProvider> =
+            Arc::new(DictionaryCandidateProvider::system(Arc::new(dictionary)));
+        Self::with_candidate_pipeline(
+            config,
+            Arc::new(ReferenceLanguageEngine),
+            vec![provider],
+            RankingEngine,
+        )
+    }
+
+    /// Creates an Engine from explicit Phase 1B language and provider components.
+    pub fn with_candidate_pipeline(
+        config: EngineConfig,
+        language: Arc<dyn LanguageEngine>,
+        providers: Vec<Arc<dyn CandidateProvider>>,
+        ranking: RankingEngine,
+    ) -> Result<Self, ImeError> {
         config.limits.validate()?;
         let engine_id = EngineId::new(next_monotonic_id(&NEXT_ENGINE_ID, "engine_id")?);
         Ok(Self {
@@ -40,6 +71,7 @@ impl ImeEngine {
                 engine_id,
                 resource_generation: ResourceGeneration::new(0),
                 config,
+                candidate_engine: CandidateEngine::new(language, providers, ranking),
             }),
         })
     }

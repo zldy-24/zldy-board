@@ -27,8 +27,24 @@ id_type!(SessionId);
 id_type!(ResourceGeneration);
 id_type!(StateRevision);
 id_type!(ActionId);
-id_type!(CandidateId);
+id_type!(LexemeId);
 id_type!(DocumentIdentity);
+
+/// Revision-scoped candidate identifier. It is never persisted as a lexeme identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CandidateId(u32);
+
+impl CandidateId {
+    /// Creates a candidate identifier from its snapshot-local value.
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the snapshot-local numeric representation.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// An opaque mode identifier. Phase 1A uses mode zero only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -55,6 +71,8 @@ pub struct CoreLimits {
     pub max_unknown_context_text_bytes: usize,
     pub max_outstanding_actions: usize,
     pub max_resolved_action_history: usize,
+    pub max_generated_candidates: usize,
+    pub max_visible_candidates: usize,
 }
 
 impl Default for CoreLimits {
@@ -66,6 +84,8 @@ impl Default for CoreLimits {
             max_unknown_context_text_bytes: 0,
             max_outstanding_actions: 64,
             max_resolved_action_history: 128,
+            max_generated_candidates: 64,
+            max_visible_candidates: 8,
         }
     }
 }
@@ -95,6 +115,26 @@ impl CoreLimits {
         if self.max_resolved_action_history == 0 {
             return Err(ImeError::InvalidConfig(
                 "max_resolved_action_history must be greater than zero",
+            ));
+        }
+        if self.max_generated_candidates == 0 {
+            return Err(ImeError::InvalidConfig(
+                "max_generated_candidates must be greater than zero",
+            ));
+        }
+        if self.max_visible_candidates == 0 {
+            return Err(ImeError::InvalidConfig(
+                "max_visible_candidates must be greater than zero",
+            ));
+        }
+        if self.max_visible_candidates > self.max_generated_candidates {
+            return Err(ImeError::InvalidConfig(
+                "visible candidate limit cannot exceed generated candidate limit",
+            ));
+        }
+        if self.max_generated_candidates > u32::MAX as usize {
+            return Err(ImeError::InvalidConfig(
+                "generated candidate limit exceeds CandidateId capacity",
             ));
         }
         Ok(())

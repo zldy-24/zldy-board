@@ -1,11 +1,12 @@
 use crate::{ActionId, CandidateId, ModeId, ResourceGeneration, SessionId, StateRevision};
 
-/// The Phase 1A session state machine.
+/// Portable session phase derived from composition and candidate state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionPhase {
     #[default]
     Idle,
     Composing,
+    CandidateSelecting,
 }
 
 /// Whether the platform should consume an original hardware event.
@@ -91,10 +92,12 @@ pub enum AckOutcome {
     },
 }
 
-/// Candidate view reserved for Phase 1B. Phase 1A always returns an empty list.
+/// Minimal candidate data exposed to platform renderers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateView {
-    pub id: CandidateId,
+    /// Identifier valid only with the containing Session revision.
+    pub candidate_id: CandidateId,
+    /// UTF-8 text committed when this candidate is selected.
     pub text: String,
 }
 
@@ -112,7 +115,12 @@ pub struct ImeState {
 
 /// Optional component that was unavailable while producing a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DegradedComponent {}
+pub enum DegradedComponent {
+    Language,
+    Dictionary,
+    Candidate,
+    Ranking,
+}
 
 /// Additional bounded-result information.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
