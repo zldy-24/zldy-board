@@ -1,0 +1,8 @@
+[package]
+name = "ime-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ime-core = { path = "../../core/ime-core" }

@@ -1,0 +1,8 @@
+[package]
+name = "ime-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+unicode-segmentation.workspace = true
