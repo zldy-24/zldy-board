@@ -2,6 +2,7 @@
 members = [
     "apps/cli",
     "core/ime-core",
+    "core/ime-ffi",
 ]
 resolver = "2"
 

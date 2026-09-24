@@ -1,6 +1,6 @@
 # Offline IME
 
-Current stage: **Phase 1B — Reference Language and Candidate Pipeline**.
+Current stage: **Phase 1.5A.1 — ABI Versioning and Panic Contract Correction**.
 
 Implemented:
 
@@ -15,17 +15,26 @@ Implemented:
 - bounded dictionary-backed candidate provider and candidate pipeline
 - Unicode-text deduplication and deterministic integer ranking
 - revision-scoped candidate snapshots, selection, and candidate commit recovery
+- a versioned, opaque-handle C ABI with Rust-owned immutable results
+- directional ABI minor-version negotiation and version-specific struct prefixes
+- catchable-panic containment and structured FFI status codes
+- C11 and C++17 Ubuntu smoke harnesses for linking, ownership, candidate flow,
+  failed-commit recovery, and engine/session lifetime
 - a small command-line REPL for exercising the Core
 
 Not implemented yet:
 
+- cross-platform ABI freeze or native linking validation beyond Ubuntu x86_64
 - real Pinyin parsing and segmentation
 - persistent dictionaries and `.imedict`
 - persistent learning
 - SQLite storage
 - model inference
-- C ABI / FFI
 - Android, Windows, Linux, or iOS input-method adapters
+
+The ABI contract, ownership rules, compatibility policy, build commands, and
+native smoke-test instructions are in [`docs/ffi.md`](docs/ffi.md). The public
+header is [`core/ime-ffi/include/ime.h`](core/ime-ffi/include/ime.h).
 
 Run the checks:
 

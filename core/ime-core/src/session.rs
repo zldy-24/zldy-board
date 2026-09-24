@@ -84,6 +84,11 @@ impl ImeSession {
         self.engine.engine_id
     }
 
+    /// Returns the immutable resources generation shared with this Session.
+    pub fn resource_generation(&self) -> crate::ResourceGeneration {
+        self.engine.resource_generation
+    }
+
     /// Returns the current state revision.
     pub const fn state_revision(&self) -> StateRevision {
         self.state_revision
@@ -92,6 +97,11 @@ impl ImeSession {
     /// Returns whether a stale failed action requires host/Core reconciliation.
     pub const fn reconciliation_required(&self) -> bool {
         self.reconciliation_required
+    }
+
+    /// Returns components currently degraded for candidate generation.
+    pub fn degraded_components(&self) -> &[DegradedComponent] {
+        &self.degraded_components
     }
 
     /// Returns a renderable snapshot without processing an event.

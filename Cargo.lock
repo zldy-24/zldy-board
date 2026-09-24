@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ime-ffi"
+version = "0.1.0"
+dependencies = [
+ "ime-core",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
